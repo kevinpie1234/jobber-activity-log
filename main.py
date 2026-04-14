@@ -151,6 +151,13 @@ JOBBER_GRAPHQL_URL = "https://api.getjobber.com/api/graphql"
 JOBBER_GRAPHQL_VERSION = "2025-04-16"
 JOBBER_TOKEN_URL = "https://api.getjobber.com/api/oauth/token"
 
+# Validated against Jobber GraphQL schema 2025-04-16.
+# Key notes:
+#   - Job has no assignedUsers field (team assignment lives on Visit)
+#   - Quote total is nested under amounts { total }
+#   - Visit has no updatedAt field
+#   - All three paginated types sort by updatedAt DESC (confirmed via introspection)
+
 JOBS_QUERY = """
 query Jobs($first: Int!, $after: String) {
   jobs(first: $first, after: $after) {
@@ -161,17 +168,12 @@ query Jobs($first: Int!, $after: String) {
       jobStatus
       createdAt
       updatedAt
+      total
       client {
         firstName
         lastName
         companyName
         isCompany
-      }
-      assignedUsers(first: 10) {
-        nodes {
-          id
-          name { full }
-        }
       }
     }
     pageInfo {
@@ -192,7 +194,7 @@ query Quotes($first: Int!, $after: String) {
       quoteStatus
       createdAt
       updatedAt
-      total
+      amounts { total }
       client {
         firstName
         lastName
@@ -242,7 +244,7 @@ query VisitsActivity($filter: VisitFilterAttributes!, $first: Int!) {
       endAt
       allDay
       createdAt
-      updatedAt
+      visitStatus
       title
       client {
         firstName
@@ -318,13 +320,14 @@ def _fetch_paginated(
     data_key: str,
     since_iso: str,
     page_size: int = 50,
-    max_pages: int = 40,
+    max_pages: int = 20,
 ) -> list[dict]:
-    """Page through all Jobber records and return those updated since since_iso.
+    """Page through a Jobber connection and return items updated since since_iso.
 
-    Does not stop early — Jobber's default sort order is not guaranteed to be
-    newest-first, so we paginate all the way through and filter client-side.
-    Capped at max_pages (40 × 50 = 2,000 records) to prevent runaway loops.
+    Jobber returns jobs/quotes/invoices sorted by updatedAt DESC (confirmed via
+    introspection). We stop as soon as the last item on a page is older than
+    since_iso — typically 1–2 pages for a day's activity. A 0.2s sleep between
+    pages keeps us comfortably below Jobber's rate limits.
     """
     nodes: list[dict] = []
     after = None
@@ -347,10 +350,13 @@ def _fetch_paginated(
             if node_time >= since_iso:
                 nodes.append(node)
 
-        if not page_info.get("hasNextPage"):
+        # Stop early: last item is older than our window (list is updatedAt DESC)
+        last_time = page_nodes[-1].get("updatedAt") or page_nodes[-1].get("createdAt") or ""
+        if last_time < since_iso or not page_info.get("hasNextPage"):
             break
 
         after = page_info.get("endCursor")
+        time.sleep(0.2)
 
     return nodes
 
@@ -432,14 +438,18 @@ def _fmt_dt_central(iso: str) -> str:
 
 
 def process_job(node: dict, since_iso: str) -> None:
-    """Detect changes on a job node and insert activity events."""
+    """Detect changes on a job node and insert activity events.
+
+    Jobs in Jobber's API do not expose an assignedUsers field — team assignment
+    lives on individual visits. Employee column is left blank for job events.
+    """
     eid = node["id"]
     ref = f"Job #{node.get('jobNumber', '?')}"
     client = _client_name(node.get("client"))
-    users = _assigned_users(node)
-    employee = ", ".join(users) if users else "Unassigned"
     event_time = node.get("updatedAt") or node.get("createdAt") or ""
     created_at = node.get("createdAt") or ""
+    total = node.get("total")
+    total_str = str(total) if total is not None else ""
 
     stored = get_entity_state("job", eid)
 
@@ -447,7 +457,7 @@ def process_job(node: dict, since_iso: str) -> None:
     current_state = {
         "jobStatus": node.get("jobStatus", ""),
         "title": node.get("title", ""),
-        "assignedUsers": sorted(users),
+        "total": total_str,
         "updatedAt": event_time,
     }
 
@@ -460,12 +470,10 @@ def process_job(node: dict, since_iso: str) -> None:
                 entity_id=eid,
                 entity_ref=ref,
                 action="Created",
-                detail=f"Status: {_fmt_status(node.get('jobStatus', ''))}",
+                detail=f"Status: {_fmt_status(node.get('jobStatus', ''))} | Total: {_fmt_currency(total)}",
                 client_name=client,
-                employee=employee,
             )
         elif event_time >= since_iso:
-            # Existed before today but was modified — log the current state as an update
             insert_event(
                 event_time=event_time,
                 entity_type="job",
@@ -474,7 +482,6 @@ def process_job(node: dict, since_iso: str) -> None:
                 action="Updated",
                 detail=f"Status: {_fmt_status(node.get('jobStatus', ''))}",
                 client_name=client,
-                employee=employee,
             )
         upsert_entity_state("job", eid, current_state, event_time)
         return
@@ -482,11 +489,9 @@ def process_job(node: dict, since_iso: str) -> None:
     prev = stored["state"]
     prev_updated = stored["updated_at"]
 
-    # Skip if nothing changed
     if event_time and prev_updated and event_time <= prev_updated:
         return
 
-    # Compare fields
     if prev.get("jobStatus") != current_state["jobStatus"]:
         insert_event(
             event_time=event_time,
@@ -496,7 +501,6 @@ def process_job(node: dict, since_iso: str) -> None:
             action="Status Changed",
             detail=f"{_fmt_status(prev.get('jobStatus', ''))} → {_fmt_status(current_state['jobStatus'])}",
             client_name=client,
-            employee=employee,
             old_value=_fmt_status(prev.get("jobStatus", "")),
             new_value=_fmt_status(current_state["jobStatus"]),
         )
@@ -510,33 +514,28 @@ def process_job(node: dict, since_iso: str) -> None:
             action="Title Updated",
             detail=f'"{current_state["title"]}"',
             client_name=client,
-            employee=employee,
             old_value=prev.get("title", ""),
             new_value=current_state["title"],
         )
 
-    if prev.get("assignedUsers", []) != current_state["assignedUsers"]:
-        old_users = ", ".join(prev.get("assignedUsers", [])) or "Unassigned"
-        new_users = ", ".join(current_state["assignedUsers"]) or "Unassigned"
+    if prev.get("total") != current_state["total"] and current_state["total"]:
         insert_event(
             event_time=event_time,
             entity_type="job",
             entity_id=eid,
             entity_ref=ref,
-            action="Team Assignment Changed",
-            detail=f"{old_users} → {new_users}",
+            action="Total Updated",
+            detail=f"{_fmt_currency(prev.get('total'))} → {_fmt_currency(total)}",
             client_name=client,
-            employee=employee,
-            old_value=old_users,
-            new_value=new_users,
+            old_value=_fmt_currency(prev.get("total")),
+            new_value=_fmt_currency(total),
         )
 
-    # If updatedAt changed but no specific field change detected, log generic update
     if (
         event_time != prev_updated
         and prev.get("jobStatus") == current_state["jobStatus"]
         and prev.get("title") == current_state["title"]
-        and prev.get("assignedUsers", []) == current_state["assignedUsers"]
+        and prev.get("total") == current_state["total"]
     ):
         insert_event(
             event_time=event_time,
@@ -546,7 +545,6 @@ def process_job(node: dict, since_iso: str) -> None:
             action="Updated",
             detail="Details edited",
             client_name=client,
-            employee=employee,
         )
 
     upsert_entity_state("job", eid, current_state, event_time)
@@ -558,13 +556,16 @@ def process_quote(node: dict, since_iso: str) -> None:
     client = _client_name(node.get("client"))
     event_time = node.get("updatedAt") or node.get("createdAt") or ""
     created_at = node.get("createdAt") or ""
+    # Quote total is nested: amounts.total (not a top-level field)
+    total = (node.get("amounts") or {}).get("total")
+    total_str = str(total) if total is not None else ""
 
     stored = get_entity_state("quote", eid)
 
     current_state = {
         "quoteStatus": node.get("quoteStatus", ""),
         "title": node.get("title", ""),
-        "total": str(node.get("total", "")),
+        "total": total_str,
         "updatedAt": event_time,
     }
 
@@ -576,7 +577,7 @@ def process_quote(node: dict, since_iso: str) -> None:
                 entity_id=eid,
                 entity_ref=ref,
                 action="Created",
-                detail=f"Status: {_fmt_status(node.get('quoteStatus', ''))} | Total: {_fmt_currency(node.get('total'))}",
+                detail=f"Status: {_fmt_status(node.get('quoteStatus', ''))} | Total: {_fmt_currency(total)}",
                 client_name=client,
             )
         elif event_time >= since_iso:
@@ -586,7 +587,7 @@ def process_quote(node: dict, since_iso: str) -> None:
                 entity_id=eid,
                 entity_ref=ref,
                 action="Updated",
-                detail=f"Status: {_fmt_status(node.get('quoteStatus', ''))} | Total: {_fmt_currency(node.get('total'))}",
+                detail=f"Status: {_fmt_status(node.get('quoteStatus', ''))} | Total: {_fmt_currency(total)}",
                 client_name=client,
             )
         upsert_entity_state("quote", eid, current_state, event_time)
@@ -618,10 +619,10 @@ def process_quote(node: dict, since_iso: str) -> None:
             entity_id=eid,
             entity_ref=ref,
             action="Total Updated",
-            detail=f"{_fmt_currency(prev.get('total'))} → {_fmt_currency(node.get('total'))}",
+            detail=f"{_fmt_currency(prev.get('total'))} → {_fmt_currency(total)}",
             client_name=client,
             old_value=_fmt_currency(prev.get("total")),
-            new_value=_fmt_currency(node.get("total")),
+            new_value=_fmt_currency(total),
         )
 
     if prev.get("title") != current_state["title"] and current_state["title"]:
@@ -753,21 +754,24 @@ def process_visit(node: dict, since_iso: str) -> None:
     client = _client_name(node.get("client"))
     users = _assigned_users(node)
     employee = ", ".join(users) if users else "Unassigned"
-    event_time = node.get("updatedAt") or node.get("startAt") or ""
+    # Visits have no updatedAt — use startAt as the display timestamp for events
+    start_at = node.get("startAt", "")
     created_at = node.get("createdAt") or ""
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     stored = get_entity_state("visit", eid)
 
+    # State snapshot — used for change detection (no updatedAt available)
     current_state = {
-        "startAt": node.get("startAt", ""),
+        "startAt": start_at,
         "endAt": node.get("endAt", ""),
         "allDay": node.get("allDay", False),
         "assignedUsers": sorted(users),
-        "updatedAt": event_time,
     }
 
     if stored is None:
-        start_fmt = _fmt_dt_central(node.get("startAt", ""))
+        # First time seeing this visit
+        start_fmt = _fmt_dt_central(start_at)
         if created_at >= since_iso:
             insert_event(
                 event_time=created_at,
@@ -779,31 +783,18 @@ def process_visit(node: dict, since_iso: str) -> None:
                 client_name=client,
                 employee=employee,
             )
-        elif event_time >= since_iso:
-            insert_event(
-                event_time=event_time,
-                entity_type="visit",
-                entity_id=eid,
-                entity_ref=ref,
-                action="Updated",
-                detail=f"Scheduled: {start_fmt}",
-                client_name=client,
-                employee=employee,
-            )
-        upsert_entity_state("visit", eid, current_state, event_time)
+        # For pre-existing visits, just store state silently (no change to report)
+        upsert_entity_state("visit", eid, current_state, now_iso)
         return
 
     prev = stored["state"]
-    prev_updated = stored["updated_at"]
 
-    if event_time and prev_updated and event_time <= prev_updated:
-        return
-
+    # Compare state — since there's no updatedAt, we always compare
     if prev.get("startAt") != current_state["startAt"]:
         old_fmt = _fmt_dt_central(prev.get("startAt", ""))
         new_fmt = _fmt_dt_central(current_state["startAt"])
         insert_event(
-            event_time=event_time,
+            event_time=now_iso,
             entity_type="visit",
             entity_id=eid,
             entity_ref=ref,
@@ -814,11 +805,12 @@ def process_visit(node: dict, since_iso: str) -> None:
             old_value=old_fmt,
             new_value=new_fmt,
         )
-    elif prev.get("endAt") != current_state["endAt"]:
+
+    if prev.get("endAt") != current_state["endAt"]:
         old_fmt = _fmt_dt_central(prev.get("endAt", ""))
         new_fmt = _fmt_dt_central(current_state["endAt"])
         insert_event(
-            event_time=event_time,
+            event_time=now_iso,
             entity_type="visit",
             entity_id=eid,
             entity_ref=ref,
@@ -834,7 +826,7 @@ def process_visit(node: dict, since_iso: str) -> None:
         old_u = ", ".join(prev.get("assignedUsers", [])) or "Unassigned"
         new_u = ", ".join(current_state["assignedUsers"]) or "Unassigned"
         insert_event(
-            event_time=event_time,
+            event_time=now_iso,
             entity_type="visit",
             entity_id=eid,
             entity_ref=ref,
@@ -846,24 +838,7 @@ def process_visit(node: dict, since_iso: str) -> None:
             new_value=new_u,
         )
 
-    if (
-        event_time != prev_updated
-        and prev.get("startAt") == current_state["startAt"]
-        and prev.get("endAt") == current_state["endAt"]
-        and prev.get("assignedUsers", []) == current_state["assignedUsers"]
-    ):
-        insert_event(
-            event_time=event_time,
-            entity_type="visit",
-            entity_id=eid,
-            entity_ref=ref,
-            action="Updated",
-            detail="Details edited",
-            client_name=client,
-            employee=employee,
-        )
-
-    upsert_entity_state("visit", eid, current_state, event_time)
+    upsert_entity_state("visit", eid, current_state, now_iso)
 
 
 # ── SECTION 5: POLLING ENGINE ────────────────────────────────────────────────────
