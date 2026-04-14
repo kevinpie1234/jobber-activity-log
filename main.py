@@ -173,15 +173,6 @@ query Jobs($first: Int!, $after: String) {
           name { full }
         }
       }
-      notes(first: 20) {
-        nodes {
-          id
-          title
-          content
-          createdAt
-          author { name { full } }
-        }
-      }
     }
     pageInfo {
       hasNextPage
@@ -327,12 +318,13 @@ def _fetch_paginated(
     data_key: str,
     since_iso: str,
     page_size: int = 50,
-    max_pages: int = 20,
+    max_pages: int = 40,
 ) -> list[dict]:
-    """Page through a Jobber connection until items are older than since_iso.
+    """Page through all Jobber records and return those updated since since_iso.
 
-    Assumes Jobber returns items newest-first (default sort). Stops early when
-    the last node on a page is older than since_iso.
+    Does not stop early — Jobber's default sort order is not guaranteed to be
+    newest-first, so we paginate all the way through and filter client-side.
+    Capped at max_pages (40 × 50 = 2,000 records) to prevent runaway loops.
     """
     nodes: list[dict] = []
     after = None
@@ -355,8 +347,7 @@ def _fetch_paginated(
             if node_time >= since_iso:
                 nodes.append(node)
 
-        last_time = page_nodes[-1].get("updatedAt") or page_nodes[-1].get("createdAt") or ""
-        if last_time < since_iso or not page_info.get("hasNextPage"):
+        if not page_info.get("hasNextPage"):
             break
 
         after = page_info.get("endCursor")
@@ -453,12 +444,10 @@ def process_job(node: dict, since_iso: str) -> None:
     stored = get_entity_state("job", eid)
 
     # Snapshot of current state for storage
-    note_ids = [n["id"] for n in (node.get("notes") or {}).get("nodes", [])]
     current_state = {
         "jobStatus": node.get("jobStatus", ""),
         "title": node.get("title", ""),
         "assignedUsers": sorted(users),
-        "noteIds": sorted(note_ids),
         "updatedAt": event_time,
     }
 
@@ -471,6 +460,18 @@ def process_job(node: dict, since_iso: str) -> None:
                 entity_id=eid,
                 entity_ref=ref,
                 action="Created",
+                detail=f"Status: {_fmt_status(node.get('jobStatus', ''))}",
+                client_name=client,
+                employee=employee,
+            )
+        elif event_time >= since_iso:
+            # Existed before today but was modified — log the current state as an update
+            insert_event(
+                event_time=event_time,
+                entity_type="job",
+                entity_id=eid,
+                entity_ref=ref,
+                action="Updated",
                 detail=f"Status: {_fmt_status(node.get('jobStatus', ''))}",
                 client_name=client,
                 employee=employee,
@@ -530,36 +531,12 @@ def process_job(node: dict, since_iso: str) -> None:
             new_value=new_users,
         )
 
-    # Check for new notes
-    prev_note_ids = set(prev.get("noteIds", []))
-    for note_node in (node.get("notes") or {}).get("nodes", []):
-        if note_node["id"] not in prev_note_ids:
-            author = ""
-            try:
-                author = note_node["author"]["name"]["full"]
-            except (KeyError, TypeError):
-                pass
-            note_title = note_node.get("title") or ""
-            note_content = note_node.get("content") or ""
-            note_preview = (note_title or note_content)[:120]
-            insert_event(
-                event_time=note_node.get("createdAt") or event_time,
-                entity_type="job",
-                entity_id=eid,
-                entity_ref=ref,
-                action="Note Added",
-                detail=note_preview,
-                client_name=client,
-                employee=author or employee,
-            )
-
     # If updatedAt changed but no specific field change detected, log generic update
     if (
         event_time != prev_updated
         and prev.get("jobStatus") == current_state["jobStatus"]
         and prev.get("title") == current_state["title"]
         and prev.get("assignedUsers", []) == current_state["assignedUsers"]
-        and set(prev.get("noteIds", [])) == set(note_ids)
     ):
         insert_event(
             event_time=event_time,
@@ -599,6 +576,16 @@ def process_quote(node: dict, since_iso: str) -> None:
                 entity_id=eid,
                 entity_ref=ref,
                 action="Created",
+                detail=f"Status: {_fmt_status(node.get('quoteStatus', ''))} | Total: {_fmt_currency(node.get('total'))}",
+                client_name=client,
+            )
+        elif event_time >= since_iso:
+            insert_event(
+                event_time=event_time,
+                entity_type="quote",
+                entity_id=eid,
+                entity_ref=ref,
+                action="Updated",
                 detail=f"Status: {_fmt_status(node.get('quoteStatus', ''))} | Total: {_fmt_currency(node.get('total'))}",
                 client_name=client,
             )
@@ -695,6 +682,16 @@ def process_invoice(node: dict, since_iso: str) -> None:
                 detail=f"Status: {_fmt_status(node.get('invoiceStatus', ''))} | Total: {_fmt_currency(node.get('total'))}",
                 client_name=client,
             )
+        elif event_time >= since_iso:
+            insert_event(
+                event_time=event_time,
+                entity_type="invoice",
+                entity_id=eid,
+                entity_ref=ref,
+                action="Updated",
+                detail=f"Status: {_fmt_status(node.get('invoiceStatus', ''))} | Total: {_fmt_currency(node.get('total'))}",
+                client_name=client,
+            )
         upsert_entity_state("invoice", eid, current_state, event_time)
         return
 
@@ -770,14 +767,25 @@ def process_visit(node: dict, since_iso: str) -> None:
     }
 
     if stored is None:
-        if created_at >= since_iso or (node.get("startAt") or "") >= since_iso:
-            start_fmt = _fmt_dt_central(node.get("startAt", ""))
+        start_fmt = _fmt_dt_central(node.get("startAt", ""))
+        if created_at >= since_iso:
             insert_event(
-                event_time=created_at or node.get("startAt", ""),
+                event_time=created_at,
                 entity_type="visit",
                 entity_id=eid,
                 entity_ref=ref,
                 action="Created",
+                detail=f"Scheduled: {start_fmt}",
+                client_name=client,
+                employee=employee,
+            )
+        elif event_time >= since_iso:
+            insert_event(
+                event_time=event_time,
+                entity_type="visit",
+                entity_id=eid,
+                entity_ref=ref,
+                action="Updated",
                 detail=f"Scheduled: {start_fmt}",
                 client_name=client,
                 employee=employee,
