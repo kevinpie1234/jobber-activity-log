@@ -236,8 +236,8 @@ query Invoices($first: Int!, $after: String) {
 """
 
 VISITS_QUERY = """
-query VisitsActivity($filter: VisitFilterAttributes!, $first: Int!) {
-  visits(filter: $filter, first: $first) {
+query VisitsActivity($filter: VisitFilterAttributes!, $first: Int!, $after: String) {
+  visits(filter: $filter, first: $first, after: $after) {
     nodes {
       id
       startAt
@@ -373,25 +373,37 @@ def fetch_recent_invoices(access_token: str, since_iso: str) -> list[dict]:
     return _fetch_paginated(access_token, INVOICES_QUERY, "invoices", since_iso)
 
 
-def fetch_recent_visits(access_token: str, since_utc: datetime) -> list[dict]:
-    """Fetch visits whose startAt falls within a broad window around now."""
-    # Cover visits from yesterday through 60 days out to catch reschedules
-    window_start = (since_utc - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def fetch_recent_visits(access_token: str) -> list[dict]:
+    """Fetch all visits in the active scheduling window (past 30 days to +60 days ahead).
+
+    Returns ALL visits in the window — no date filter applied here. The change
+    detection logic in process_visit decides what to log based on stored state.
+    Visits have no updatedAt field, so we must compare state on every cycle.
+    """
+    window_start = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     window_end = (datetime.now(timezone.utc) + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    since_iso = since_utc.isoformat()
+    base_filter = {"startAt": {"after": window_start, "before": window_end}}
 
-    try:
-        data = _run_query(
-            access_token,
-            VISITS_QUERY,
-            {"filter": {"startAt": {"after": window_start, "before": window_end}}, "first": 200},
-        )
-        nodes = data["visits"]["nodes"]
-    except Exception as exc:
-        print(f"[VISITS QUERY ERROR] {exc}", flush=True)
-        return []
+    nodes: list[dict] = []
+    after = None
+    for _ in range(20):  # Max 1,000 visits
+        variables = {"filter": base_filter, "first": 50}
+        if after:
+            variables["after"] = after
+        try:
+            data = _run_query(access_token, VISITS_QUERY, variables)
+        except Exception as exc:
+            print(f"[VISITS QUERY ERROR] {exc}", flush=True)
+            break
+        page_nodes = data["visits"]["nodes"]
+        page_info = data["visits"]["pageInfo"]
+        nodes.extend(page_nodes)
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+        time.sleep(0.2)
 
-    return [n for n in nodes if (n.get("updatedAt") or n.get("createdAt") or "") >= since_iso]
+    return nodes
 
 
 # ── SECTION 4: CHANGE DETECTION ─────────────────────────────────────────────────
@@ -898,16 +910,14 @@ def run_poll_cycle(since_utc: datetime) -> None:
         print(f"[POLL INVOICES ERROR] {exc}", flush=True)
 
     # Visits
-    try:
-        visits = fetch_recent_visits(token, since_utc)
-        print(f"[POLL] {len(visits)} visits to process", flush=True)
-        for node in visits:
-            try:
-                process_visit(node, since_iso)
-            except Exception as exc:
-                print(f"[VISIT ERROR] {node.get('id')}: {exc}", flush=True)
-    except Exception as exc:
-        print(f"[POLL VISITS ERROR] {exc}", flush=True)
+    # Visits: fetch all in active window every cycle (no updatedAt available)
+    visits = fetch_recent_visits(token)
+    print(f"[POLL] {len(visits)} visits to process", flush=True)
+    for node in visits:
+        try:
+            process_visit(node, since_iso)
+        except Exception as exc:
+            print(f"[VISIT ERROR] {node.get('id')}: {exc}", flush=True)
 
     _last_error = ""
     _last_poll_time = datetime.now(CENTRAL_TZ).strftime("%b %-d, %Y %-I:%M %p CT")
