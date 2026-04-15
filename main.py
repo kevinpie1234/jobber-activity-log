@@ -183,12 +183,14 @@ query Jobs($first: Int!, $after: String) {
       }
       notes(first: 10) {
         nodes {
-          id
-          content
-          createdAt
-          updatedAt
-          createdBy { id name { full } }
-          lastEditedBy { id name { full } }
+          ... on JobNote {
+            id
+            content
+            createdAt
+            updatedAt
+            createdBy { id name { full } }
+            lastEditedBy { id name { full } }
+          }
         }
       }
     }
@@ -219,12 +221,14 @@ query Quotes($first: Int!, $after: String) {
       }
       notes(first: 10) {
         nodes {
-          id
-          content
-          createdAt
-          updatedAt
-          createdBy { id name { full } }
-          lastEditedBy { id name { full } }
+          ... on QuoteNote {
+            id
+            content
+            createdAt
+            updatedAt
+            createdBy { id name { full } }
+            lastEditedBy { id name { full } }
+          }
         }
       }
     }
@@ -254,12 +258,14 @@ query Invoices($first: Int!, $after: String) {
       }
       notes(first: 10) {
         nodes {
-          id
-          content
-          createdAt
-          updatedAt
-          createdBy { id name { full } }
-          lastEditedBy { id name { full } }
+          ... on InvoiceNote {
+            id
+            content
+            createdAt
+            updatedAt
+            createdBy { id name { full } }
+            lastEditedBy { id name { full } }
+          }
         }
       }
     }
@@ -299,7 +305,7 @@ query VisitsActivity($filter: VisitFilterAttributes!, $first: Int!, $after: Stri
         }
       }
       createdBy { id name { full } }
-      completedBy { id name { full } }
+      completedBy
     }
     pageInfo {
       hasNextPage
@@ -320,13 +326,6 @@ query Expenses($first: Int!, $after: String) {
       updatedAt
       enteredBy { id name { full } }
       paidBy { id name { full } }
-      job { jobNumber }
-      client {
-        firstName
-        lastName
-        companyName
-        isCompany
-      }
     }
     pageInfo {
       hasNextPage
@@ -337,8 +336,8 @@ query Expenses($first: Int!, $after: String) {
 """
 
 TIMESHEETS_QUERY = """
-query TimesheetEntries($first: Int!, $after: String) {
-  timesheetEntries(first: $first, after: $after) {
+query TimeSheetEntries($first: Int!, $after: String) {
+  timeSheetEntries(first: $first, after: $after) {
     nodes {
       id
       startAt
@@ -348,7 +347,6 @@ query TimesheetEntries($first: Int!, $after: String) {
       approvedAt
       approvedBy { id name { full } }
       user { id name { full } }
-      job { jobNumber }
     }
     pageInfo {
       hasNextPage
@@ -465,7 +463,7 @@ def fetch_recent_expenses(access_token: str, since_iso: str) -> list[dict]:
 
 
 def fetch_recent_timesheets(access_token: str, since_iso: str) -> list[dict]:
-    return _fetch_paginated(access_token, TIMESHEETS_QUERY, "timesheetEntries", since_iso)
+    return _fetch_paginated(access_token, TIMESHEETS_QUERY, "timeSheetEntries", since_iso)
 
 
 def fetch_single_job(access_token: str, job_id: str) -> Optional[dict]:
@@ -554,7 +552,7 @@ def fetch_single_visit(access_token: str, visit_id: str) -> Optional[dict]:
         job { jobNumber title }
         assignedUsers(first: 10) { nodes { id name { full } } }
         createdBy { id name { full } }
-        completedBy { id name { full } }
+        completedBy
       }
     }
     """
@@ -1063,7 +1061,7 @@ def process_visit(node: dict, since_iso: str) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     visit_status = node.get("visitStatus", "")
     created_by = _user_name(node.get("createdBy"))
-    completed_by = _user_name(node.get("completedBy"))
+    completed_by = node.get("completedBy") or ""  # scalar String in Jobber API
 
     stored = get_entity_state("visit", eid)
 
@@ -1178,10 +1176,7 @@ def process_visit(node: dict, since_iso: str) -> None:
 
 def process_expense(node: dict, since_iso: str) -> None:
     eid = node["id"]
-    job = node.get("job") or {}
-    job_num = job.get("jobNumber")
-    ref = f"Expense (Job #{job_num})" if job_num else "Expense"
-    client = _client_name(node.get("client"))
+    ref = "Expense"
     event_time = node.get("updatedAt") or node.get("createdAt") or ""
     created_at = node.get("createdAt") or ""
     entered_by = _user_name(node.get("enteredBy"))
@@ -1207,7 +1202,6 @@ def process_expense(node: dict, since_iso: str) -> None:
                 entity_ref=ref,
                 action="Expense Entered",
                 detail=f"{description} | {_fmt_currency(total)}" if description else _fmt_currency(total),
-                client_name=client,
                 action_by=entered_by,
             )
         upsert_entity_state("expense", eid, current_state, event_time)
@@ -1228,7 +1222,6 @@ def process_expense(node: dict, since_iso: str) -> None:
             entity_ref=ref,
             action="Expense Paid",
             detail=f"{description} | {_fmt_currency(total)}" if description else _fmt_currency(total),
-            client_name=client,
             action_by=paid_by,
         )
 
@@ -1237,9 +1230,7 @@ def process_expense(node: dict, since_iso: str) -> None:
 
 def process_timesheet(node: dict, since_iso: str) -> None:
     eid = node["id"]
-    job = node.get("job") or {}
-    job_num = job.get("jobNumber")
-    ref = f"Timesheet (Job #{job_num})" if job_num else "Timesheet"
+    ref = "Timesheet"
     event_time = node.get("updatedAt") or node.get("createdAt") or ""
     created_at = node.get("createdAt") or ""
     worker = _user_name(node.get("user"))
