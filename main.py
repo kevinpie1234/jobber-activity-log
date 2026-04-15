@@ -21,8 +21,8 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi import FastAPI, Form, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from jinja2 import Environment, select_autoescape
 
 # ── SECTION 1: CONFIGURATION ────────────────────────────────────────────────────
@@ -63,6 +63,7 @@ def init_db() -> None:
                 detail       TEXT,
                 client_name  TEXT,
                 employee     TEXT,
+                action_by    TEXT,
                 old_value    TEXT,
                 new_value    TEXT
             );
@@ -75,6 +76,10 @@ def init_db() -> None:
                 PRIMARY KEY (entity_type, entity_id)
             );
         """)
+        # Migration: add action_by column if it doesn't exist yet (for existing DBs)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(activity_log)").fetchall()}
+        if "action_by" not in existing:
+            conn.execute("ALTER TABLE activity_log ADD COLUMN action_by TEXT")
 
 
 def insert_event(
@@ -86,6 +91,7 @@ def insert_event(
     detail: str = "",
     client_name: str = "",
     employee: str = "",
+    action_by: str = "",
     old_value: str = "",
     new_value: str = "",
 ) -> None:
@@ -94,10 +100,10 @@ def insert_event(
         conn.execute(
             """INSERT INTO activity_log
                (logged_at, event_time, entity_type, entity_id, entity_ref,
-                action, detail, client_name, employee, old_value, new_value)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                action, detail, client_name, employee, action_by, old_value, new_value)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (now, event_time, entity_type, entity_id, entity_ref,
-             action, detail, client_name, employee, old_value, new_value),
+             action, detail, client_name, employee, action_by, old_value, new_value),
         )
 
 
@@ -116,7 +122,7 @@ def get_all_events_for_csv() -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT event_time, entity_type, entity_ref, action, detail,
-                      client_name, employee, old_value, new_value, logged_at
+                      client_name, employee, action_by, old_value, new_value, logged_at
                FROM activity_log ORDER BY event_time DESC, id DESC"""
         ).fetchall()
     return [dict(r) for r in rows]
@@ -175,6 +181,16 @@ query Jobs($first: Int!, $after: String) {
         companyName
         isCompany
       }
+      notes(first: 10) {
+        nodes {
+          id
+          content
+          createdAt
+          updatedAt
+          createdBy { id name { full } }
+          lastEditedBy { id name { full } }
+        }
+      }
     }
     pageInfo {
       hasNextPage
@@ -201,6 +217,16 @@ query Quotes($first: Int!, $after: String) {
         companyName
         isCompany
       }
+      notes(first: 10) {
+        nodes {
+          id
+          content
+          createdAt
+          updatedAt
+          createdBy { id name { full } }
+          lastEditedBy { id name { full } }
+        }
+      }
     }
     pageInfo {
       hasNextPage
@@ -225,6 +251,16 @@ query Invoices($first: Int!, $after: String) {
         lastName
         companyName
         isCompany
+      }
+      notes(first: 10) {
+        nodes {
+          id
+          content
+          createdAt
+          updatedAt
+          createdBy { id name { full } }
+          lastEditedBy { id name { full } }
+        }
       }
     }
     pageInfo {
@@ -262,6 +298,57 @@ query VisitsActivity($filter: VisitFilterAttributes!, $first: Int!, $after: Stri
           name { full }
         }
       }
+      createdBy { id name { full } }
+      completedBy { id name { full } }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"""
+
+EXPENSES_QUERY = """
+query Expenses($first: Int!, $after: String) {
+  expenses(first: $first, after: $after) {
+    nodes {
+      id
+      description
+      total
+      createdAt
+      updatedAt
+      enteredBy { id name { full } }
+      paidBy { id name { full } }
+      job { jobNumber }
+      client {
+        firstName
+        lastName
+        companyName
+        isCompany
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"""
+
+TIMESHEETS_QUERY = """
+query TimesheetEntries($first: Int!, $after: String) {
+  timesheetEntries(first: $first, after: $after) {
+    nodes {
+      id
+      startAt
+      endAt
+      createdAt
+      updatedAt
+      approvedAt
+      approvedBy { id name { full } }
+      user { id name { full } }
+      job { jobNumber }
     }
     pageInfo {
       hasNextPage
@@ -373,6 +460,112 @@ def fetch_recent_invoices(access_token: str, since_iso: str) -> list[dict]:
     return _fetch_paginated(access_token, INVOICES_QUERY, "invoices", since_iso)
 
 
+def fetch_recent_expenses(access_token: str, since_iso: str) -> list[dict]:
+    return _fetch_paginated(access_token, EXPENSES_QUERY, "expenses", since_iso)
+
+
+def fetch_recent_timesheets(access_token: str, since_iso: str) -> list[dict]:
+    return _fetch_paginated(access_token, TIMESHEETS_QUERY, "timesheetEntries", since_iso)
+
+
+def fetch_single_job(access_token: str, job_id: str) -> Optional[dict]:
+    """Fetch a single job by ID for webhook-triggered updates."""
+    query = """
+    query Job($id: EncodedId!) {
+      job(id: $id) {
+        id jobNumber title jobStatus createdAt updatedAt total
+        client { firstName lastName companyName isCompany }
+        notes(first: 10) {
+          nodes {
+            id content createdAt updatedAt
+            createdBy { id name { full } }
+            lastEditedBy { id name { full } }
+          }
+        }
+      }
+    }
+    """
+    try:
+        data = _run_query(access_token, query, {"id": job_id})
+        return data.get("job")
+    except Exception as exc:
+        print(f"[WEBHOOK] fetch_single_job {job_id}: {exc}", flush=True)
+        return None
+
+
+def fetch_single_quote(access_token: str, quote_id: str) -> Optional[dict]:
+    """Fetch a single quote by ID for webhook-triggered updates."""
+    query = """
+    query Quote($id: EncodedId!) {
+      quote(id: $id) {
+        id quoteNumber title quoteStatus createdAt updatedAt
+        amounts { total }
+        client { firstName lastName companyName isCompany }
+        notes(first: 10) {
+          nodes {
+            id content createdAt updatedAt
+            createdBy { id name { full } }
+            lastEditedBy { id name { full } }
+          }
+        }
+      }
+    }
+    """
+    try:
+        data = _run_query(access_token, query, {"id": quote_id})
+        return data.get("quote")
+    except Exception as exc:
+        print(f"[WEBHOOK] fetch_single_quote {quote_id}: {exc}", flush=True)
+        return None
+
+
+def fetch_single_invoice(access_token: str, invoice_id: str) -> Optional[dict]:
+    """Fetch a single invoice by ID for webhook-triggered updates."""
+    query = """
+    query Invoice($id: EncodedId!) {
+      invoice(id: $id) {
+        id invoiceNumber invoiceStatus createdAt updatedAt total
+        client { firstName lastName companyName isCompany }
+        notes(first: 10) {
+          nodes {
+            id content createdAt updatedAt
+            createdBy { id name { full } }
+            lastEditedBy { id name { full } }
+          }
+        }
+      }
+    }
+    """
+    try:
+        data = _run_query(access_token, query, {"id": invoice_id})
+        return data.get("invoice")
+    except Exception as exc:
+        print(f"[WEBHOOK] fetch_single_invoice {invoice_id}: {exc}", flush=True)
+        return None
+
+
+def fetch_single_visit(access_token: str, visit_id: str) -> Optional[dict]:
+    """Fetch a single visit by ID for webhook-triggered updates."""
+    query = """
+    query Visit($id: EncodedId!) {
+      visit(id: $id) {
+        id startAt endAt allDay createdAt visitStatus title
+        client { firstName lastName companyName isCompany }
+        job { jobNumber title }
+        assignedUsers(first: 10) { nodes { id name { full } } }
+        createdBy { id name { full } }
+        completedBy { id name { full } }
+      }
+    }
+    """
+    try:
+        data = _run_query(access_token, query, {"id": visit_id})
+        return data.get("visit")
+    except Exception as exc:
+        print(f"[WEBHOOK] fetch_single_visit {visit_id}: {exc}", flush=True)
+        return None
+
+
 def fetch_recent_visits(access_token: str) -> list[dict]:
     """Fetch all visits in the active scheduling window (past 30 days to +60 days ahead).
 
@@ -407,6 +600,16 @@ def fetch_recent_visits(access_token: str) -> list[dict]:
 
 
 # ── SECTION 4: CHANGE DETECTION ─────────────────────────────────────────────────
+
+def _user_name(user: Optional[dict]) -> str:
+    """Extract the full name from a Jobber User object."""
+    if not user:
+        return ""
+    try:
+        return user["name"]["full"]
+    except (KeyError, TypeError):
+        return ""
+
 
 def _client_name(client: Optional[dict]) -> str:
     if not client:
@@ -495,6 +698,8 @@ def process_job(node: dict, since_iso: str) -> None:
                 detail=f"Status: {_fmt_status(node.get('jobStatus', ''))}",
                 client_name=client,
             )
+        note_state = _process_notes(node.get("notes"), "job", eid, ref, client, {})
+        current_state.update(note_state)
         upsert_entity_state("job", eid, current_state, event_time)
         return
 
@@ -502,6 +707,11 @@ def process_job(node: dict, since_iso: str) -> None:
     prev_updated = stored["updated_at"]
 
     if event_time and prev_updated and event_time <= prev_updated:
+        # Still check for new notes even if nothing else changed
+        note_state = _process_notes(node.get("notes"), "job", eid, ref, client, prev)
+        if note_state != {k: prev.get(k) for k in ("note_ids", "note_updated_ats")}:
+            current_state.update(note_state)
+            upsert_entity_state("job", eid, current_state, event_time)
         return
 
     if prev.get("jobStatus") != current_state["jobStatus"]:
@@ -559,6 +769,8 @@ def process_job(node: dict, since_iso: str) -> None:
             client_name=client,
         )
 
+    note_state = _process_notes(node.get("notes"), "job", eid, ref, client, prev)
+    current_state.update(note_state)
     upsert_entity_state("job", eid, current_state, event_time)
 
 
@@ -602,6 +814,8 @@ def process_quote(node: dict, since_iso: str) -> None:
                 detail=f"Status: {_fmt_status(node.get('quoteStatus', ''))} | Total: {_fmt_currency(total)}",
                 client_name=client,
             )
+        note_state = _process_notes(node.get("notes"), "quote", eid, ref, client, {})
+        current_state.update(note_state)
         upsert_entity_state("quote", eid, current_state, event_time)
         return
 
@@ -609,6 +823,10 @@ def process_quote(node: dict, since_iso: str) -> None:
     prev_updated = stored["updated_at"]
 
     if event_time and prev_updated and event_time <= prev_updated:
+        note_state = _process_notes(node.get("notes"), "quote", eid, ref, client, prev)
+        if note_state != {k: prev.get(k) for k in ("note_ids", "note_updated_ats")}:
+            current_state.update(note_state)
+            upsert_entity_state("quote", eid, current_state, event_time)
         return
 
     if prev.get("quoteStatus") != current_state["quoteStatus"]:
@@ -666,6 +884,8 @@ def process_quote(node: dict, since_iso: str) -> None:
             client_name=client,
         )
 
+    note_state = _process_notes(node.get("notes"), "quote", eid, ref, client, prev)
+    current_state.update(note_state)
     upsert_entity_state("quote", eid, current_state, event_time)
 
 
@@ -705,6 +925,8 @@ def process_invoice(node: dict, since_iso: str) -> None:
                 detail=f"Status: {_fmt_status(node.get('invoiceStatus', ''))} | Total: {_fmt_currency(node.get('total'))}",
                 client_name=client,
             )
+        note_state = _process_notes(node.get("notes"), "invoice", eid, ref, client, {})
+        current_state.update(note_state)
         upsert_entity_state("invoice", eid, current_state, event_time)
         return
 
@@ -712,6 +934,10 @@ def process_invoice(node: dict, since_iso: str) -> None:
     prev_updated = stored["updated_at"]
 
     if event_time and prev_updated and event_time <= prev_updated:
+        note_state = _process_notes(node.get("notes"), "invoice", eid, ref, client, prev)
+        if note_state != {k: prev.get(k) for k in ("note_ids", "note_updated_ats")}:
+            current_state.update(note_state)
+            upsert_entity_state("invoice", eid, current_state, event_time)
         return
 
     if prev.get("invoiceStatus") != current_state["invoiceStatus"]:
@@ -755,7 +981,72 @@ def process_invoice(node: dict, since_iso: str) -> None:
             client_name=client,
         )
 
+    note_state = _process_notes(node.get("notes"), "invoice", eid, ref, client, prev)
+    current_state.update(note_state)
     upsert_entity_state("invoice", eid, current_state, event_time)
+
+
+def _process_notes(
+    notes_connection: Optional[dict],
+    entity_type: str,
+    entity_id: str,
+    entity_ref: str,
+    client: str,
+    stored_state: dict,
+) -> dict:
+    """Detect new or edited notes on a job/quote/invoice. Returns updated note state."""
+    nodes = []
+    try:
+        nodes = (notes_connection or {}).get("nodes", [])
+    except (AttributeError, TypeError):
+        pass
+
+    prev_note_ids: set = set(stored_state.get("note_ids", []))
+    prev_note_updated: dict = stored_state.get("note_updated_ats", {})
+
+    current_note_ids = []
+    current_note_updated = {}
+
+    for note in nodes:
+        nid = note.get("id", "")
+        if not nid:
+            continue
+        note_updated = note.get("updatedAt") or note.get("createdAt") or ""
+        note_created = note.get("createdAt") or ""
+        current_note_ids.append(nid)
+        current_note_updated[nid] = note_updated
+
+        content = (note.get("content") or "")[:120]
+        created_by = _user_name(note.get("createdBy"))
+        last_edited_by = _user_name(note.get("lastEditedBy"))
+
+        if nid not in prev_note_ids:
+            # Brand new note
+            insert_event(
+                event_time=note_created,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                entity_ref=entity_ref,
+                action="Note Added",
+                detail=content,
+                client_name=client,
+                action_by=created_by,
+            )
+        elif prev_note_updated.get(nid) and note_updated > prev_note_updated[nid]:
+            # Existing note was edited
+            editor = last_edited_by or created_by
+            insert_event(
+                event_time=note_updated,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                entity_ref=entity_ref,
+                action="Note Edited",
+                detail=content,
+                client_name=client,
+                action_by=editor,
+            )
+
+    return {"note_ids": current_note_ids, "note_updated_ats": current_note_updated}
 
 
 def process_visit(node: dict, since_iso: str) -> None:
@@ -770,6 +1061,9 @@ def process_visit(node: dict, since_iso: str) -> None:
     start_at = node.get("startAt", "")
     created_at = node.get("createdAt") or ""
     now_iso = datetime.now(timezone.utc).isoformat()
+    visit_status = node.get("visitStatus", "")
+    created_by = _user_name(node.get("createdBy"))
+    completed_by = _user_name(node.get("completedBy"))
 
     stored = get_entity_state("visit", eid)
 
@@ -779,6 +1073,8 @@ def process_visit(node: dict, since_iso: str) -> None:
         "endAt": node.get("endAt", ""),
         "allDay": node.get("allDay", False),
         "assignedUsers": sorted(users),
+        "visitStatus": visit_status,
+        "completedBy": completed_by,
     }
 
     if stored is None:
@@ -794,7 +1090,20 @@ def process_visit(node: dict, since_iso: str) -> None:
                 detail=f"Scheduled: {start_fmt}",
                 client_name=client,
                 employee=employee,
+                action_by=created_by,
             )
+            if visit_status == "COMPLETED":
+                insert_event(
+                    event_time=now_iso,
+                    entity_type="visit",
+                    entity_id=eid,
+                    entity_ref=ref,
+                    action="Completed",
+                    detail=f"Completed by: {completed_by}" if completed_by else "Visit marked complete",
+                    client_name=client,
+                    employee=employee,
+                    action_by=completed_by,
+                )
         # For pre-existing visits, just store state silently (no change to report)
         upsert_entity_state("visit", eid, current_state, now_iso)
         return
@@ -850,7 +1159,137 @@ def process_visit(node: dict, since_iso: str) -> None:
             new_value=new_u,
         )
 
+    # Detect newly completed visits
+    if prev.get("visitStatus") != "COMPLETED" and visit_status == "COMPLETED":
+        insert_event(
+            event_time=now_iso,
+            entity_type="visit",
+            entity_id=eid,
+            entity_ref=ref,
+            action="Completed",
+            detail=f"Completed by: {completed_by}" if completed_by else "Visit marked complete",
+            client_name=client,
+            employee=employee,
+            action_by=completed_by,
+        )
+
     upsert_entity_state("visit", eid, current_state, now_iso)
+
+
+def process_expense(node: dict, since_iso: str) -> None:
+    eid = node["id"]
+    job = node.get("job") or {}
+    job_num = job.get("jobNumber")
+    ref = f"Expense (Job #{job_num})" if job_num else "Expense"
+    client = _client_name(node.get("client"))
+    event_time = node.get("updatedAt") or node.get("createdAt") or ""
+    created_at = node.get("createdAt") or ""
+    entered_by = _user_name(node.get("enteredBy"))
+    paid_by = _user_name(node.get("paidBy"))
+    total = node.get("total")
+    description = (node.get("description") or "")[:80]
+
+    stored = get_entity_state("expense", eid)
+
+    current_state = {
+        "total": str(total) if total is not None else "",
+        "enteredBy": entered_by,
+        "paidBy": paid_by,
+        "updatedAt": event_time,
+    }
+
+    if stored is None:
+        if created_at >= since_iso:
+            insert_event(
+                event_time=created_at,
+                entity_type="expense",
+                entity_id=eid,
+                entity_ref=ref,
+                action="Expense Entered",
+                detail=f"{description} | {_fmt_currency(total)}" if description else _fmt_currency(total),
+                client_name=client,
+                action_by=entered_by,
+            )
+        upsert_entity_state("expense", eid, current_state, event_time)
+        return
+
+    prev = stored["state"]
+    prev_updated = stored["updated_at"]
+
+    if event_time and prev_updated and event_time <= prev_updated:
+        return
+
+    # Detect when an expense gets marked paid (paidBy appears)
+    if not prev.get("paidBy") and paid_by:
+        insert_event(
+            event_time=event_time,
+            entity_type="expense",
+            entity_id=eid,
+            entity_ref=ref,
+            action="Expense Paid",
+            detail=f"{description} | {_fmt_currency(total)}" if description else _fmt_currency(total),
+            client_name=client,
+            action_by=paid_by,
+        )
+
+    upsert_entity_state("expense", eid, current_state, event_time)
+
+
+def process_timesheet(node: dict, since_iso: str) -> None:
+    eid = node["id"]
+    job = node.get("job") or {}
+    job_num = job.get("jobNumber")
+    ref = f"Timesheet (Job #{job_num})" if job_num else "Timesheet"
+    event_time = node.get("updatedAt") or node.get("createdAt") or ""
+    created_at = node.get("createdAt") or ""
+    worker = _user_name(node.get("user"))
+    approved_by = _user_name(node.get("approvedBy"))
+    start_at = node.get("startAt", "")
+    approved_at = node.get("approvedAt") or ""
+
+    stored = get_entity_state("timesheet", eid)
+
+    current_state = {
+        "approvedBy": approved_by,
+        "approvedAt": approved_at,
+        "updatedAt": event_time,
+    }
+
+    if stored is None:
+        if created_at >= since_iso:
+            start_fmt = _fmt_dt_central(start_at)
+            insert_event(
+                event_time=created_at,
+                entity_type="timesheet",
+                entity_id=eid,
+                entity_ref=ref,
+                action="Time Logged",
+                detail=f"Worker: {worker} | Start: {start_fmt}" if worker else f"Start: {start_fmt}",
+                employee=worker,
+            )
+        upsert_entity_state("timesheet", eid, current_state, event_time)
+        return
+
+    prev = stored["state"]
+    prev_updated = stored["updated_at"]
+
+    if event_time and prev_updated and event_time <= prev_updated:
+        return
+
+    # Detect approval
+    if not prev.get("approvedBy") and approved_by:
+        insert_event(
+            event_time=approved_at or event_time,
+            entity_type="timesheet",
+            entity_id=eid,
+            entity_ref=ref,
+            action="Timesheet Approved",
+            detail=f"Worker: {worker}" if worker else "",
+            employee=worker,
+            action_by=approved_by,
+        )
+
+    upsert_entity_state("timesheet", eid, current_state, event_time)
 
 
 # ── SECTION 5: POLLING ENGINE ────────────────────────────────────────────────────
@@ -919,6 +1358,30 @@ def run_poll_cycle(since_utc: datetime) -> None:
         except Exception as exc:
             print(f"[VISIT ERROR] {node.get('id')}: {exc}", flush=True)
 
+    # Expenses
+    try:
+        expenses = fetch_recent_expenses(token, since_iso)
+        print(f"[POLL] {len(expenses)} expenses to process", flush=True)
+        for node in expenses:
+            try:
+                process_expense(node, since_iso)
+            except Exception as exc:
+                print(f"[EXPENSE ERROR] {node.get('id')}: {exc}", flush=True)
+    except Exception as exc:
+        print(f"[POLL EXPENSES ERROR] {exc}", flush=True)
+
+    # Timesheets
+    try:
+        timesheets = fetch_recent_timesheets(token, since_iso)
+        print(f"[POLL] {len(timesheets)} timesheets to process", flush=True)
+        for node in timesheets:
+            try:
+                process_timesheet(node, since_iso)
+            except Exception as exc:
+                print(f"[TIMESHEET ERROR] {node.get('id')}: {exc}", flush=True)
+    except Exception as exc:
+        print(f"[POLL TIMESHEETS ERROR] {exc}", flush=True)
+
     _last_error = ""
     _last_poll_time = datetime.now(CENTRAL_TZ).strftime("%b %-d, %Y %-I:%M %p CT")
     print(f"[POLL] Cycle complete at {_last_poll_time}", flush=True)
@@ -942,10 +1405,12 @@ def polling_loop() -> None:
 _jinja_env = Environment(autoescape=select_autoescape(["html"]))
 
 _BADGE_COLORS = {
-    "job":     ("#1a6b3c", "#d4edda"),
-    "quote":   ("#0d3b82", "#d0e4ff"),
-    "invoice": ("#7d4e00", "#fff3cd"),
-    "visit":   ("#5b2d8e", "#ede0ff"),
+    "job":       ("#1a6b3c", "#d4edda"),
+    "quote":     ("#0d3b82", "#d0e4ff"),
+    "invoice":   ("#7d4e00", "#fff3cd"),
+    "visit":     ("#5b2d8e", "#ede0ff"),
+    "expense":   ("#7a1c1c", "#fde8e8"),
+    "timesheet": ("#1c4e7a", "#e0f0ff"),
 }
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
@@ -1088,22 +1553,32 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="filters">
     <label>Type:</label>
     <select id="filter-type" onchange="applyFilters()">
-      <option value="">All</option>
+      <option value="">All Types</option>
       <option value="job">Job</option>
       <option value="quote">Quote</option>
       <option value="invoice">Invoice</option>
       <option value="visit">Visit</option>
+      <option value="expense">Expense</option>
+      <option value="timesheet">Timesheet</option>
     </select>
     <label>Action:</label>
     <select id="filter-action" onchange="applyFilters()">
-      <option value="">All</option>
+      <option value="">All Actions</option>
       <option value="Created">Created</option>
       <option value="Status Changed">Status Changed</option>
       <option value="Visit Rescheduled">Visit Rescheduled</option>
+      <option value="Completed">Completed</option>
       <option value="Team Assignment Changed">Team Assignment Changed</option>
       <option value="Note Added">Note Added</option>
+      <option value="Note Edited">Note Edited</option>
+      <option value="Expense Entered">Expense Entered</option>
+      <option value="Expense Paid">Expense Paid</option>
+      <option value="Time Logged">Time Logged</option>
+      <option value="Timesheet Approved">Timesheet Approved</option>
       <option value="Updated">Updated</option>
     </select>
+    <label>Action By:</label>
+    <input type="text" id="filter-actionby" placeholder="User name…" oninput="applyFilters()" style="width:140px">
     <label>Search:</label>
     <input type="text" id="filter-search" placeholder="Client, employee, detail…" oninput="applyFilters()" style="width:200px">
     <span class="count-badge" id="row-count">{{ events|length }} events</span>
@@ -1123,6 +1598,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           <th>Reference</th>
           <th>Action</th>
           <th>Client</th>
+          <th>Action By</th>
           <th>Employee</th>
           <th>Detail</th>
         </tr>
@@ -1132,7 +1608,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
         <tr
           data-type="{{ e.entity_type }}"
           data-action="{{ e.action }}"
-          data-search="{{ (e.client_name ~ ' ' ~ e.employee ~ ' ' ~ e.detail ~ ' ' ~ e.entity_ref)|lower }}"
+          data-actionby="{{ (e.action_by or '')|lower }}"
+          data-search="{{ (e.client_name ~ ' ' ~ e.employee ~ ' ' ~ (e.action_by or '') ~ ' ' ~ e.detail ~ ' ' ~ e.entity_ref)|lower }}"
         >
           <td class="time-cell">{{ fmt_dt(e.event_time) }}</td>
           <td>
@@ -1142,6 +1619,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           <td style="white-space:nowrap;font-weight:600">{{ e.entity_ref }}</td>
           <td class="action-cell">{{ e.action }}</td>
           <td class="client-cell">{{ e.client_name }}</td>
+          <td class="employee-cell" style="color:#1a6b3c;font-weight:{% if e.action_by %}600{% else %}400{% endif %}">{{ e.action_by or '' }}</td>
           <td class="employee-cell">{{ e.employee }}</td>
           <td class="detail-cell">
             {{ e.detail }}
@@ -1159,14 +1637,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     function applyFilters() {
       const type = document.getElementById('filter-type').value.toLowerCase();
       const action = document.getElementById('filter-action').value.toLowerCase();
+      const actionby = document.getElementById('filter-actionby').value.toLowerCase();
       const search = document.getElementById('filter-search').value.toLowerCase();
       const rows = document.querySelectorAll('#log-table tbody tr');
       let visible = 0;
       rows.forEach(row => {
         const matchType = !type || row.dataset.type === type;
         const matchAction = !action || row.dataset.action.toLowerCase().includes(action);
+        const matchActionBy = !actionby || (row.dataset.actionby || '').includes(actionby);
         const matchSearch = !search || row.dataset.search.includes(search);
-        const show = matchType && matchAction && matchSearch;
+        const show = matchType && matchAction && matchActionBy && matchSearch;
         row.style.display = show ? '' : 'none';
         if (show) visible++;
       });
@@ -1327,7 +1807,7 @@ async def export_csv(request: Request):
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=[
         "event_time", "entity_type", "entity_ref", "action",
-        "client_name", "employee", "detail", "old_value", "new_value", "logged_at",
+        "client_name", "action_by", "employee", "detail", "old_value", "new_value", "logged_at",
     ])
     writer.writeheader()
     for row in rows:
@@ -1339,3 +1819,128 @@ async def export_csv(request: Request):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── SECTION 9: WEBHOOK ENDPOINT ───────────────────────────────────────────────────
+#
+# Configure Jobber to POST webhooks to: https://<your-domain>/webhook/jobber
+#
+# In Jobber Developer Console → App Settings → Webhooks, add the URL and copy
+# the webhook secret into Railway env var JOBBER_WEBHOOK_SECRET.
+#
+# Supported Jobber webhook topics (subscribe to these):
+#   JOB_CREATE, JOB_UPDATE, JOB_DELETE
+#   QUOTE_CREATE, QUOTE_UPDATE, QUOTE_DELETE
+#   INVOICE_CREATE, INVOICE_UPDATE, INVOICE_DELETE
+#   VISIT_CREATE, VISIT_UPDATE, VISIT_DELETE
+#   EXPENSE_CREATE, EXPENSE_UPDATE
+#   TIMESHEET_ENTRY_CREATE, TIMESHEET_ENTRY_UPDATE
+
+def _verify_jobber_webhook(body: bytes, signature_header: str) -> bool:
+    """Verify Jobber's HMAC-SHA256 webhook signature.
+
+    Jobber sends X-Jobber-Hmac-SHA256: base64(HMAC-SHA256(secret, body)).
+    Returns True if the signature matches or if no secret is configured (dev mode).
+    """
+    secret = os.environ.get("JOBBER_WEBHOOK_SECRET", "")
+    if not secret:
+        # No secret configured — accept all (dev/testing mode only)
+        return True
+    import base64
+    expected = base64.b64encode(
+        hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    ).decode()
+    return secrets.compare_digest(signature_header or "", expected)
+
+
+def _handle_webhook_payload(topic: str, object_id: str) -> None:
+    """Background task: re-fetch the affected object and run change detection."""
+    print(f"[WEBHOOK] topic={topic} id={object_id}", flush=True)
+    try:
+        token = refresh_access_token()
+    except Exception as exc:
+        print(f"[WEBHOOK] token refresh failed: {exc}", flush=True)
+        return
+
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    topic_upper = topic.upper()
+
+    if topic_upper.startswith("JOB_"):
+        node = fetch_single_job(token, object_id)
+        if node:
+            try:
+                process_job(node, since_iso)
+            except Exception as exc:
+                print(f"[WEBHOOK] process_job error: {exc}", flush=True)
+
+    elif topic_upper.startswith("QUOTE_"):
+        node = fetch_single_quote(token, object_id)
+        if node:
+            try:
+                process_quote(node, since_iso)
+            except Exception as exc:
+                print(f"[WEBHOOK] process_quote error: {exc}", flush=True)
+
+    elif topic_upper.startswith("INVOICE_"):
+        node = fetch_single_invoice(token, object_id)
+        if node:
+            try:
+                process_invoice(node, since_iso)
+            except Exception as exc:
+                print(f"[WEBHOOK] process_invoice error: {exc}", flush=True)
+
+    elif topic_upper.startswith("VISIT_"):
+        node = fetch_single_visit(token, object_id)
+        if node:
+            try:
+                process_visit(node, since_iso)
+            except Exception as exc:
+                print(f"[WEBHOOK] process_visit error: {exc}", flush=True)
+
+    else:
+        print(f"[WEBHOOK] unhandled topic: {topic}", flush=True)
+
+
+@app.post("/webhook/jobber")
+async def jobber_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Receive real-time event notifications from Jobber.
+
+    Jobber calls this endpoint whenever a subscribed object changes.
+    We verify the signature, extract the topic + object ID, then re-fetch
+    the object in the background so change detection runs immediately
+    (rather than waiting for the next 2-minute poll cycle).
+    """
+    body = await request.body()
+    signature = request.headers.get("X-Jobber-Hmac-SHA256", "")
+
+    if not _verify_jobber_webhook(body, signature):
+        print("[WEBHOOK] Invalid signature — rejected", flush=True)
+        return JSONResponse({"error": "invalid signature"}, status_code=401)
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+
+    # Jobber webhook payload shape: { "webHookEvent": { "topic": "...", "appId": "...",
+    #   "accountId": "...", "data": { "item": { "id": "..." } } } }
+    event = payload.get("webHookEvent", payload)
+    topic = event.get("topic", "")
+    object_id = (event.get("data", {}).get("item") or {}).get("id", "")
+
+    if not topic or not object_id:
+        print(f"[WEBHOOK] Missing topic or id in payload: {payload}", flush=True)
+        return JSONResponse({"ok": True})  # Still 200 so Jobber doesn't retry
+
+    background_tasks.add_task(_handle_webhook_payload, topic, object_id)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/status")
+async def status():
+    """Health check endpoint — returns last poll time and any error."""
+    return JSONResponse({
+        "last_poll": _last_poll_time,
+        "last_error": _last_error,
+        "webhook_secret_configured": bool(os.environ.get("JOBBER_WEBHOOK_SECRET")),
+    })
