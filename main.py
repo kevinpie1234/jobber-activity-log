@@ -185,11 +185,10 @@ query Jobs($first: Int!, $after: String) {
         nodes {
           ... on JobNote {
             id
-            content
             createdAt
-            updatedAt
-            createdBy { id name { full } }
-            lastEditedBy { id name { full } }
+            createdBy {
+              ... on User { id name { full } }
+            }
           }
         }
       }
@@ -223,11 +222,10 @@ query Quotes($first: Int!, $after: String) {
         nodes {
           ... on QuoteNote {
             id
-            content
             createdAt
-            updatedAt
-            createdBy { id name { full } }
-            lastEditedBy { id name { full } }
+            createdBy {
+              ... on User { id name { full } }
+            }
           }
         }
       }
@@ -260,11 +258,10 @@ query Invoices($first: Int!, $after: String) {
         nodes {
           ... on InvoiceNote {
             id
-            content
             createdAt
-            updatedAt
-            createdBy { id name { full } }
-            lastEditedBy { id name { full } }
+            createdBy {
+              ... on User { id name { full } }
+            }
           }
         }
       }
@@ -344,7 +341,6 @@ query TimeSheetEntries($first: Int!, $after: String) {
       endAt
       createdAt
       updatedAt
-      approvedAt
       approvedBy { id name { full } }
       user { id name { full } }
     }
@@ -707,7 +703,7 @@ def process_job(node: dict, since_iso: str) -> None:
     if event_time and prev_updated and event_time <= prev_updated:
         # Still check for new notes even if nothing else changed
         note_state = _process_notes(node.get("notes"), "job", eid, ref, client, prev)
-        if note_state != {k: prev.get(k) for k in ("note_ids", "note_updated_ats")}:
+        if note_state.get("note_ids") != prev.get("note_ids"):
             current_state.update(note_state)
             upsert_entity_state("job", eid, current_state, event_time)
         return
@@ -822,7 +818,7 @@ def process_quote(node: dict, since_iso: str) -> None:
 
     if event_time and prev_updated and event_time <= prev_updated:
         note_state = _process_notes(node.get("notes"), "quote", eid, ref, client, prev)
-        if note_state != {k: prev.get(k) for k in ("note_ids", "note_updated_ats")}:
+        if note_state.get("note_ids") != prev.get("note_ids"):
             current_state.update(note_state)
             upsert_entity_state("quote", eid, current_state, event_time)
         return
@@ -933,7 +929,7 @@ def process_invoice(node: dict, since_iso: str) -> None:
 
     if event_time and prev_updated and event_time <= prev_updated:
         note_state = _process_notes(node.get("notes"), "invoice", eid, ref, client, prev)
-        if note_state != {k: prev.get(k) for k in ("note_ids", "note_updated_ats")}:
+        if note_state.get("note_ids") != prev.get("note_ids"):
             current_state.update(note_state)
             upsert_entity_state("invoice", eid, current_state, event_time)
         return
@@ -1000,51 +996,30 @@ def _process_notes(
         pass
 
     prev_note_ids: set = set(stored_state.get("note_ids", []))
-    prev_note_updated: dict = stored_state.get("note_updated_ats", {})
-
     current_note_ids = []
-    current_note_updated = {}
 
     for note in nodes:
         nid = note.get("id", "")
         if not nid:
             continue
-        note_updated = note.get("updatedAt") or note.get("createdAt") or ""
         note_created = note.get("createdAt") or ""
         current_note_ids.append(nid)
-        current_note_updated[nid] = note_updated
-
-        content = (note.get("content") or "")[:120]
         created_by = _user_name(note.get("createdBy"))
-        last_edited_by = _user_name(note.get("lastEditedBy"))
 
         if nid not in prev_note_ids:
-            # Brand new note
+            # Brand new note — log it with author attribution
             insert_event(
                 event_time=note_created,
                 entity_type=entity_type,
                 entity_id=entity_id,
                 entity_ref=entity_ref,
                 action="Note Added",
-                detail=content,
+                detail="",
                 client_name=client,
                 action_by=created_by,
             )
-        elif prev_note_updated.get(nid) and note_updated > prev_note_updated[nid]:
-            # Existing note was edited
-            editor = last_edited_by or created_by
-            insert_event(
-                event_time=note_updated,
-                entity_type=entity_type,
-                entity_id=entity_id,
-                entity_ref=entity_ref,
-                action="Note Edited",
-                detail=content,
-                client_name=client,
-                action_by=editor,
-            )
 
-    return {"note_ids": current_note_ids, "note_updated_ats": current_note_updated}
+    return {"note_ids": current_note_ids}
 
 
 def process_visit(node: dict, since_iso: str) -> None:
@@ -1236,13 +1211,11 @@ def process_timesheet(node: dict, since_iso: str) -> None:
     worker = _user_name(node.get("user"))
     approved_by = _user_name(node.get("approvedBy"))
     start_at = node.get("startAt", "")
-    approved_at = node.get("approvedAt") or ""
 
     stored = get_entity_state("timesheet", eid)
 
     current_state = {
         "approvedBy": approved_by,
-        "approvedAt": approved_at,
         "updatedAt": event_time,
     }
 
@@ -1270,7 +1243,7 @@ def process_timesheet(node: dict, since_iso: str) -> None:
     # Detect approval
     if not prev.get("approvedBy") and approved_by:
         insert_event(
-            event_time=approved_at or event_time,
+            event_time=event_time,
             entity_type="timesheet",
             entity_id=eid,
             entity_ref=ref,
