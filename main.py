@@ -155,7 +155,8 @@ def upsert_entity_state(entity_type: str, entity_id: str, state: dict, updated_a
 
 JOBBER_GRAPHQL_URL = "https://api.getjobber.com/api/graphql"
 JOBBER_GRAPHQL_VERSION = "2025-04-16"
-JOBBER_TOKEN_URL = "https://api.getjobber.com/api/oauth/token"
+JOBBER_TOKEN_URL = os.environ["JOBBER_TOKEN_URL"]   # token broker endpoint
+BROKER_API_KEY = os.environ["BROKER_API_KEY"]
 
 # Validated against Jobber GraphQL schema 2025-04-16.
 # Key notes:
@@ -354,27 +355,14 @@ query TimeSheetEntries($first: Int!, $after: String) {
 
 
 def refresh_access_token() -> str:
-    """Exchange the current refresh token for a fresh access token.
-
-    The Jobber refresh token rotates on every use. The new token is printed
-    to logs so it can be manually updated in Railway environment variables.
-    """
-    response = requests.post(
+    """Fetch a valid Jobber access token from the token broker."""
+    response = requests.get(
         JOBBER_TOKEN_URL,
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": os.environ["JOBBER_REFRESH_TOKEN"],
-            "client_id": os.environ["JOBBER_CLIENT_ID"],
-            "client_secret": os.environ["JOBBER_CLIENT_SECRET"],
-        },
+        headers={"X-API-Key": BROKER_API_KEY},
+        timeout=15,
     )
     response.raise_for_status()
-    data = response.json()
-    new_refresh_token = data["refresh_token"]
-    access_token = data["access_token"]
-    os.environ["JOBBER_REFRESH_TOKEN"] = new_refresh_token
-    print(f"[TOKEN ROTATION] New JOBBER_REFRESH_TOKEN: {new_refresh_token}", flush=True)
-    return access_token
+    return response.json()["access_token"]
 
 
 def _run_query(access_token: str, query: str, variables: dict) -> dict:
